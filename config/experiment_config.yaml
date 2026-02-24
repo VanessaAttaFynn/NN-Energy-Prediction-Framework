@@ -1,0 +1,120 @@
+# ══════════════════════════════════════════════════════════════
+# Experiment Configuration
+# Energy Consumption Prediction Framework
+# ══════════════════════════════════════════════════════════════
+
+data:
+  butter_e:
+    main_file: "runs_with_standardized_energy.csv"
+    node_info: "node_sinfo.csv"
+    dataset_meta: "pmlb.csv"
+    gpu_specs: "NVIDIA_GPU_Processors_curated.csv"
+    target_column: "std_energy"  # standardized energy (corrected for idle power)
+    filter_column: "filter"      # True = exclude (outlier/bad data)
+  
+  ec_nas:
+    source: "https://github.com/saintslab/EC-NAS-Bench"
+    target_column: "energy"  # TBD - confirm after inspecting dataset
+
+  split:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+    random_seed: 42
+    stratify_by: ["is_gpu", "shape"]  # ensure hardware/arch balance
+
+features:
+  architecture:
+    - size              # trainable parameters
+    - depth             # number of layers
+    - shape             # network shape (categorical, 8 types)
+    - width_depth_ratio # engineered: max_width / depth
+    - estimated_flops   # engineered: approximate FLOPs
+  
+  hardware:
+    - is_gpu            # CPU vs GPU
+    - node_cpus         # from node_sinfo.csv
+    - node_memory       # from node_sinfo.csv
+    - gpu_type          # from node_sinfo.csv GRES column
+    - gpu_tdp           # from NVIDIA_GPU_Processors_curated.csv
+    - gpu_gflops        # from NVIDIA_GPU_Processors_curated.csv
+  
+  training_config:
+    - batch_size        # needs string → int conversion
+    - learning_rate     # needs string → float conversion
+    - optimizer         # categorical
+    - n_observations    # from pmlb.csv (dataset size)
+    - n_features        # from pmlb.csv (input dimensions)
+    - n_classes         # from pmlb.csv (output classes)
+
+  preprocessing:
+    log_transform: ["size", "estimated_flops", "n_observations", "std_energy"]
+    standard_scale: true
+    categorical_encoding: "onehot"  # for shape, optimizer, gpu_type, dataset
+
+models:
+  random_forest:
+    n_estimators: [100, 300, 500]
+    max_depth: [10, 20, 30, null]
+    min_samples_split: [2, 5, 10]
+    tuning: "grid_search_cv"
+    cv_folds: 5
+  
+  xgboost:
+    n_estimators: [100, 300, 500, 1000]
+    max_depth: [3, 5, 7, 10]
+    learning_rate: [0.01, 0.05, 0.1]
+    subsample: [0.7, 0.8, 0.9]
+    tuning: "optuna_bayesian"
+    n_trials: 100
+  
+  neural_network:
+    hidden_layers: [[128, 64], [256, 128, 64], [512, 256, 128, 64]]
+    dropout: [0.1, 0.2, 0.3]
+    batch_size: 256
+    max_epochs: 200
+    early_stopping_patience: 15
+    optimizer: "adam"
+    lr_scheduler: "reduce_on_plateau"
+
+baselines:
+  flop_based:
+    formula: "total_flops * (tdp / peak_gflops)"
+  
+  linear_scaling:
+    formula: "a * size * epochs + b"
+    fit_on_train: true
+
+evaluation:
+  metrics:
+    - mae    # Mean Absolute Error
+    - rmse   # Root Mean Squared Error
+    - r2     # R-squared
+    - mape   # Mean Absolute Percentage Error
+  
+  protocols:
+    within_architecture:
+      - train: "butter_e"
+        test: "butter_e"
+        name: "MLP → MLP"
+      - train: "ec_nas"
+        test: "ec_nas"
+        name: "CNN → CNN"
+    
+    cross_architecture:
+      - train: "butter_e"
+        test: "ec_nas"
+        name: "MLP → CNN"
+      - train: "ec_nas"
+        test: "butter_e"
+        name: "CNN → MLP"
+    
+    combined:
+      - train: "butter_e + ec_nas"
+        test: "butter_e + ec_nas"
+        name: "MLP+CNN → Any"
+
+  interpretability:
+    shap_analysis: true
+    permutation_importance: true
+    n_shap_samples: 1000  # subsample for SHAP (full dataset too slow)
