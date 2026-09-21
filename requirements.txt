@@ -26,3 +26,4 @@ codecarbon>=2.4
 pyyaml>=6.0
 joblib>=1.3
 tqdm>=4.65
+protobuf>=4.25  # decodes EC-NAS's 4V hardware-benchmark TFRecords (see src/data/nasbench_proto)
