@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 COMBINED = "data/processed/combined/combined_features.csv"
 RANDOM_STATE = 42
+MAIN_MODEL = "rf"  # main predictor; set with --model
 TEST_SIZE = 0.2
 
 CORE = ["params", "depth", "epochs", "batch_size"]
@@ -73,21 +74,28 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"mape": mape, "r2_raw": r2_raw, "r2_log": r2_log, "tau": tau}
 
 
+def make_estimator(model: str, seed: int = RANDOM_STATE):
+    if model == "rf":
+        return RandomForestRegressor(n_estimators=300, n_jobs=-1,
+                                     random_state=seed)
+    if model == "xgb":
+        from xgboost import XGBRegressor
+        return XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.1,
+                            n_jobs=-1, random_state=seed, verbosity=0)
+    raise ValueError(model)
+
+
 def fit_eval(train: pd.DataFrame, test: pd.DataFrame, feats: list[str],
-             target: str = "target", model: str = "rf",
+             target: str = "target", model: str | None = None,
              log_target: bool = True) -> dict:
+    model = model or MAIN_MODEL
     x_tr = train[feats].to_numpy(dtype=float)
     x_te = test[feats].to_numpy(dtype=float)
     y_tr = train[target].to_numpy(dtype=float)
     y_te = test[target].to_numpy(dtype=float)
 
-    if model == "rf":
-        est = RandomForestRegressor(n_estimators=300, n_jobs=-1,
-                                    random_state=RANDOM_STATE)
-    elif model == "xgb":
-        from xgboost import XGBRegressor
-        est = XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.1,
-                           n_jobs=-1, random_state=RANDOM_STATE, verbosity=0)
+    if model in ("rf", "xgb"):
+        est = make_estimator(model)
     elif model == "mlp":
         from importlib import import_module
         TorchMLPRegressor = import_module(
@@ -119,9 +127,14 @@ def split_rows(df: pd.DataFrame, group_wise: bool):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/tables/experiments.csv")
+    ap.add_argument("--model", default="rf", choices=["rf", "xgb"],
+                    help="main predictor used for every experiment except the "
+                         "baselines and the model comparison")
     ap.add_argument("--fresh", action="store_true",
                     help="ignore any existing results file and recompute all")
     args = ap.parse_args()
+    global MAIN_MODEL
+    MAIN_MODEL = args.model
 
     df = pd.read_csv(COMBINED)
     butter = df[df.family == "MLP"].copy()
@@ -155,14 +168,16 @@ def main() -> None:
         for group_wise, split_name in ((True, "group"), (False, "row")):
             tr, te = split_rows(subset, group_wise)
             res = fit_eval(subset.iloc[tr], subset.iloc[te], feats)
-            add(f"within:{label}", res, split_name, feats, "rf", len(tr), len(te))
+            add(f"within:{label}", res, split_name, feats, MAIN_MODEL,
+            len(tr), len(te))
 
     # ---- within-family, core features only (isolates the auxiliary gain) --
     for label, subset in (("butter_e", butter), ("ec_nas", ecnas)):
         feats = CORE
         tr, te = split_rows(subset, True)
         res = fit_eval(subset.iloc[tr], subset.iloc[te], feats)
-        add(f"within_core:{label}", res, "group", feats, "rf", len(tr), len(te))
+        add(f"within_core:{label}", res, "group", feats, MAIN_MODEL,
+            len(tr), len(te))
 
     # ---- BUTTER-E feature progression ------------------------------------
     # The successive feature additions reported for BUTTER-E: the shared core
@@ -178,7 +193,7 @@ def main() -> None:
     tr, te = split_rows(butter, True)
     for label, f in levels:
         res = fit_eval(butter.iloc[tr], butter.iloc[te], f)
-        add("butter_e_feature_progression", res, f"group:{label}", f, "rf",
+        add("butter_e_feature_progression", res, f"group:{label}", f, MAIN_MODEL,
             len(tr), len(te))
 
     # ---- pooled ----------------------------------------------------------
@@ -186,7 +201,8 @@ def main() -> None:
     for group_wise, split_name in ((True, "group"), (False, "row")):
         tr, te = split_rows(df, group_wise)
         res = fit_eval(df.iloc[tr], df.iloc[te], feats)
-        add("pooled", res, split_name, feats, "rf", len(tr), len(te))
+        add("pooled", res, split_name, feats, MAIN_MODEL,
+            len(tr), len(te))
 
     # ---- weak baseline: parameter count only, per family ------------------
     for label, subset in (("butter_e", butter), ("ec_nas", ecnas)):
@@ -200,7 +216,8 @@ def main() -> None:
                                       ("mlp", "cnn", butter, ecnas)):
         res = fit_eval(a, b, CORE)
         add(f"transfer:{train_fam}_to_{test_fam}", res, "full-holdout", CORE,
-            "rf", len(a), len(b))
+            MAIN_MODEL,
+            len(a), len(b))
 
     # ---- RQ2: measurement-bias correction, pooled, group split ------------
     tr, te = split_rows(df, True)
@@ -212,7 +229,7 @@ def main() -> None:
             cnn = frame.family == "CNN"
             frame.loc[cnn, "target"] = frame.loc[cnn, "target"] * 1.25
         res = fit_eval(frame.iloc[tr], frame.iloc[te], feats)
-        add("pooled_bias_correction", res, f"group:{label}", feats, "rf",
+        add("pooled_bias_correction", res, f"group:{label}", feats, MAIN_MODEL,
             len(tr), len(te))
 
     # ---- leave-one-dataset-out, BUTTER-E ---------------------------------
@@ -227,8 +244,8 @@ def main() -> None:
     add("lodo:butter_e",
         {k: float((lodo_df[k] * weights).sum())
          for k in ("mape", "r2_raw", "r2_log", "tau")},
-        "leave-one-dataset-out", bfeats, "rf",
-        len(butter) - int(lodo_df["n_test"].max()), int(lodo_df["n_test"].max()))
+        "leave-one-dataset-out", bfeats, MAIN_MODEL,
+            len(butter) - int(lodo_df["n_test"].max()), int(lodo_df["n_test"].max()))
 
     # ---- model comparison on the pooled core feature set ------------------
     # Reproduces the model-selection table: a parameter-count-only linear
@@ -267,8 +284,8 @@ def main() -> None:
                 continue
             test = hw[hw.gpu_type == gpu]
             res = fit_eval(train, test, CORE)
-            add(f"hardware_holdout:{gpu}", res, "full-holdout", CORE, "rf",
-                len(train), len(test))
+            add(f"hardware_holdout:{gpu}", res, "full-holdout", CORE, MAIN_MODEL,
+            len(train), len(test))
 
     # ---- RQ3: output structure, pooled, group split -----------------------
     # Variant A predicts log power and log duration separately and recomposes
@@ -277,17 +294,16 @@ def main() -> None:
     tr, te = split_rows(df, True)
     train, test = df.iloc[tr], df.iloc[te]
     res_b = fit_eval(train, test, feats)
-    add("output_structure", res_b, "group:B_direct_energy", feats, "rf",
-        len(tr), len(te))
+    add("output_structure", res_b, "group:B_direct_energy", feats, MAIN_MODEL,
+            len(tr), len(te))
 
     power_pred = duration_pred = None
     for col in ("power", "duration"):
-        est = RandomForestRegressor(n_estimators=300, n_jobs=-1,
-                                    random_state=RANDOM_STATE)
+        est = make_estimator(MAIN_MODEL)
         est.fit(train[feats].to_numpy(float), np.log1p(train[col].to_numpy(float)))
         pred = np.expm1(est.predict(test[feats].to_numpy(float)))
         sub = metrics(test[col].to_numpy(float), pred)
-        add(f"output_structure_submodel:{col}", sub, "group", feats, "rf",
+        add(f"output_structure_submodel:{col}", sub, "group", feats, MAIN_MODEL,
             len(tr), len(te))
         if col == "power":
             power_pred = pred
@@ -296,8 +312,8 @@ def main() -> None:
 
     res_a = metrics(test["target"].to_numpy(float),
                     power_pred * duration_pred)
-    add("output_structure", res_a, "group:A_power_x_duration", feats, "rf",
-        len(tr), len(te))
+    add("output_structure", res_a, "group:A_power_x_duration", feats, MAIN_MODEL,
+            len(tr), len(te))
 
     out = pd.DataFrame(records)
     out.to_csv(args.out, index=False)
